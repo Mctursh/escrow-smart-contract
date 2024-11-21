@@ -1,0 +1,3 @@
+[submodule "app"]
+	path = app
+	url = https://github.com/Mctursh/escrow-client.git
