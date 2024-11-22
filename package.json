@@ -1,0 +1,5 @@
+{
+  "scripts": {
+    "install-deps": "node init-dependencies.js"
+  }
+}

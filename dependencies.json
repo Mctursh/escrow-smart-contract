@@ -1,0 +1,10 @@
+{
+  "repositories": [
+    {
+      "name": "escrow client",
+      "url": "https://github.com/Mctursh/escrow-client.git",
+      "branch": "main",
+      "target": "vendor/app"
+    }
+  ]
+}
