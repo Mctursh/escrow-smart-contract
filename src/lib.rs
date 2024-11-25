@@ -1,6 +1,8 @@
 use solana_program::{
-    account_info::{next_account_info, AccountInfo}, entrypoint::ProgramResult, entrypoint, msg, program::{invoke, invoke_signed}, program_error::ProgramError, pubkey::Pubkey, rent::Rent, system_instruction, sysvar::Sysvar
+    account_info::{next_account_info, AccountInfo}, entrypoint::ProgramResult, entrypoint, msg, native_token::LAMPORTS_PER_SOL, program::{invoke, invoke_signed}, program_error::ProgramError, pubkey::Pubkey, rent::Rent, system_instruction, system_program, sysvar::Sysvar
 };
+
+use spl_token::instruction::transfer as spl_token_transfer;
 
 use borsh::{
     BorshSerialize,
@@ -17,6 +19,14 @@ pub struct SellOrder {
     pub amount: u64,//8
     pub price: u64, //8
     pub status: OrderStatus, //1
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Debug)]
+pub struct BuyOrder {
+    pub order_id: u64, //8
+    pub buyer: Pubkey, //32
+    pub escrow_account: Pubkey, //32
+    pub amount: u64,//8
 }
 
 // #[derive(BorshDeserialize, BorshSerialize, Debug)]
@@ -85,7 +95,7 @@ pub fn create_sell_order(
         ProgramError::InvalidInstructionData
     })?;
 
-    
+
     if counter_account.data_is_empty() {
         msg!("Creating COunter");
         let _ = initialize_counter(program_id, accounts);
@@ -242,8 +252,220 @@ pub fn initialize_counter(
 fn fulfil_buy_order(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
-    instruction_data: &[u8],
+    _instruction_data: &[u8],
 ) -> ProgramResult {
+    // const USDC_TOKEN_MINT: &str = "Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr";
+    // const USDC_TOKEN_MINT: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
+    const USDC_DECIMAL: u64 = 1000000;
+    let accounts_iterations = &mut accounts.iter();
+
+    let authority = next_account_info(accounts_iterations)?;
+    let token_program_account = next_account_info(accounts_iterations)?;
+    let system_program = next_account_info(accounts_iterations)?;
+    let seller_account = next_account_info(accounts_iterations)?;
+    let buyer_account = next_account_info(accounts_iterations)?;
+    let escrow_account = next_account_info(accounts_iterations)?;
+    let seller_associated_token_account = next_account_info(accounts_iterations)?;
+    let buyer_associated_token_account = next_account_info(accounts_iterations)?;
+
+    let buy_order_data = BuyOrder::try_from_slice(_instruction_data).map_err(|err| {
+        msg!("Error Deseriealizing order, {:?}", err);
+        ProgramError::InvalidInstructionData
+    })?;
+
+    let mut escrow_account_data = SellOrder::try_from_slice(&escrow_account.data.borrow()).map_err(|err| {
+        msg!("Error Deseriealizing order, {:?}", err);
+        ProgramError::InvalidInstructionData
+    })?;
+
+    if &buy_order_data.escrow_account != escrow_account.key {
+        msg!("Escrow account does not match instruction");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    if &buy_order_data.buyer != buyer_account.key {
+        msg!("Buyer address doe not match instruction");
+        return Err(ProgramError::InvalidInstructionData); 
+    }
+
+    if buy_order_data.amount < escrow_account_data.amount {
+        msg!("Error Insufficient funds");
+        return Err(ProgramError::InsufficientFunds);
+    }
+
+    if escrow_account_data.order_id != buy_order_data.order_id {
+        msg!("Order Id on account does not match orer id in instruction");
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // if escrow_account.owner != program_id { 
+    if escrow_account.owner != program_id {
+        msg!("account is not owned by program");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    let seeds = &[
+        SellOrder::SEED_PREFIX,
+        seller_account.key.as_ref(),
+        &buy_order_data.order_id.to_le_bytes(),
+    ];
+
+    let (_, bump) = Pubkey::find_program_address(seeds, program_id);
+
+    let signer_seeds  = &[
+        SellOrder::SEED_PREFIX,
+        seller_account.key.as_ref(),
+        &buy_order_data.order_id.to_le_bytes(),
+        &[bump]
+    ];
+
+    let usdc_to_transfer_in_decimals = ((escrow_account_data.amount * escrow_account_data.price) / LAMPORTS_PER_SOL) * USDC_DECIMAL;
+
+    let transfer_to_seller_ix = spl_token_transfer(
+        &spl_token::id(), // Token program ID (usually "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+        buyer_associated_token_account.key, // Source token account
+        seller_associated_token_account.key, // Destination token account
+        buyer_account.key, // Authority (signer)
+        &[], // Signers (for multisig accounts, otherwise empty)
+        usdc_to_transfer_in_decimals, // Amount of tokens to transfer
+    )?;
+
+    // Transfer USDC to seller
+    invoke(
+        &transfer_to_seller_ix,
+        &[
+            buyer_associated_token_account.clone(),
+            seller_associated_token_account.clone(),
+            buyer_account.clone(),
+            token_program_account.clone()
+        ]
+    )?;
+
+    let sol_to_transfer_in_lamports = escrow_account_data.amount;
+
+    //Manual trasfer logic
+    if escrow_account.lamports() < sol_to_transfer_in_lamports {
+        return Err(ProgramError::InsufficientFunds);
+    }
+
+    // Subtract lamports from source
+    **escrow_account.lamports.borrow_mut() -= sol_to_transfer_in_lamports;
     
+    // Add lamports to destination
+    **buyer_account.lamports.borrow_mut() += sol_to_transfer_in_lamports;
+
+    // let transfer_to_buyer_ix = &system_instruction::transfer(
+    //     escrow_account.key,
+    //     buyer_account.key,
+    //     sol_to_transfer_in_lamports
+    // );
+
+    // //Clear here
+
+    // // Transfer SOl to buyer
+    // invoke_signed(
+    //     transfer_to_buyer_ix,
+    //     &[
+    //         escrow_account.clone(),
+    //         buyer_account.clone(),
+    //         system_program.clone(),
+    //         // authority.clone(),
+    //     ],
+    //     &[signer_seeds],
+    //     // &[seeds, &[&[bump]]],
+    // )?;
+
+    escrow_account_data.status = OrderStatus::Completed;
+    let _ = escrow_account_data.serialize(&mut &mut escrow_account.data.borrow_mut()[..]);
+
+
+    // Step 1: Transfer remaining SOL from the PDA to the authority account
+    let escrow_account_balance = **escrow_account.lamports.borrow();
+    
+
+    if escrow_account_balance > 0 {
+        msg!("Transferring {} lamports to authority", escrow_account_balance);
+
+        **escrow_account.lamports.borrow_mut() -= escrow_account_balance;
+
+        **authority.lamports.borrow_mut() += escrow_account_balance;
+
+        // let transfer_instruction = system_instruction::transfer(
+        //     &escrow_account.key,    // From PDA account
+        //     authority.key,     // To authority account
+        //     escrow_account_balance,               // Amount to transfer
+        // );
+
+        // invoke_signed(
+        //     &transfer_instruction,
+        //     &[
+        //         escrow_account.clone(),
+        //         authority.clone(),
+        //         system_program.clone(),
+        //     ],
+        //     &[signer_seeds], // PDA seeds for signing
+        //     // &[seeds, &[&[bump]]], // PDA seeds for signing
+        // )?;
+    }
+ 
+     // Step 2: Close the PDA account
+     msg!("Closing the PDA account");
+ 
+     // Set the PDA's lamports to 0 and assign ownership to the System Program
+     **escrow_account.lamports.borrow_mut() = 0;
+    //  **authority.lamports.borrow_mut() += escrow_account_balance;
+     escrow_account.try_borrow_mut_data()?.fill(0); // Clear any account data
+     escrow_account.assign(&system_program::ID); // Assign ownership to the system program
+ 
+     msg!("PDA account successfully closed");
+
     Ok(())
 }
+
+
+
+// fn close_pda_account(
+//     program_id: &Pubkey,
+//     accounts: &[AccountInfo],
+//     seeds: &[&[u8]], 
+// ) -> ProgramResult {
+    
+//     let escrow_account_balance = **escrow_account.lamports.borrow();
+//     let seeds = &[
+//         SellOrder::SEED_PREFIX,
+//         seller_account.key.as_ref(),
+//         &escrow_account_data.order_id.to_le_bytes(),
+//     ];
+
+//     if escrow_account_balance > 0 {
+//         msg!("Transferring {} lamports to authority", escrow_account_balance);
+
+//         let transfer_instruction = system_instruction::transfer(
+//             escrow_account.key,    // From PDA account
+//             authority.key,     // To authority account
+//             escrow_account_balance,               // Amount to transfer
+//         );
+
+//         invoke_signed(
+//             &transfer_instruction,
+//             &[
+//             escrow_account.clone(),
+//                 authority.clone(),
+//                 system_program.clone(),
+//             ],
+//             &[seeds], // PDA seeds for signing
+//         )?;
+//     }
+ 
+//      // Step 2: Close the PDA account
+//      msg!("Closing the PDA account");
+ 
+//      // Set the PDA's lamports to 0 and assign ownership to the System Program
+//      **escrow_account.lamports.borrow_mut() = 0;
+//     //  **authority.lamports.borrow_mut() += escrow_account_balance;
+//      escrow_account.try_borrow_mut_data()?.fill(0); // Clear any account data
+//      escrow_account.assign(&system_program::ID); // Assign ownership to the system program
+ 
+//      msg!("PDA account successfully closed");
+//     Ok(())
+// }
