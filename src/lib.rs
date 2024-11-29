@@ -48,12 +48,13 @@ pub struct OrderCounter {
 }
 
 impl OrderCounter {
-    pub const SEED_PREFIX: &'static [u8] = b"order_counter";
+    pub const SEED_PREFIX: &'static [u8] = b"order_counter_v2";
     pub const SIZE: usize = 8 + 32; // u64 + Pubkey
 }
 
 impl SellOrder {
-    pub const SEED_PREFIX: &'static [u8] = b"escrow_order";
+    pub const SEED_PREFIX: &'static [u8] = b"escrow_order_v2";
+    pub const SEED_TOKEN_PREFIX: &'static [u8] = b"escrow_token_order_v2";
     // Calculate full size based on your struct
     pub const SIZE: usize = 8 + 32 + 32 + 8 + 8 + 1; // order_id + pubkey + amount + status
     // pub const SIZE: usize = 8 + 32 + 33 + 32 + 8 + 8 + 1; // order_id + pubkey + amount + status
@@ -89,6 +90,7 @@ pub fn create_sell_order(
     let system_program = next_account_info(account_iterations)?;
     let seller_account = next_account_info(account_iterations)?;
     let escrow_account = next_account_info(account_iterations)?;
+    let escrow_sol_token_account = next_account_info(account_iterations)?;
 
     let sell_order_data = SellOrder::try_from_slice(_instruction_data).map_err(|err| {
         msg!("Error Deseriealizing order, {:?}", err);
@@ -113,6 +115,13 @@ pub fn create_sell_order(
 
     let (escrow_pda, bump) = Pubkey::find_program_address(seeds, program_id);
 
+    let seeds = &[
+        SellOrder::SEED_TOKEN_PREFIX,
+        escrow_pda.as_ref(),
+    ];
+
+    let (escrow_sol_token_pda, escrow_sol_token_bump) = Pubkey::find_program_address(seeds, program_id);
+
     // Validates that data address matches the account address
     if sell_order_data.seller != *seller_account.key {
         msg!("Invalid seller address");
@@ -121,10 +130,6 @@ pub fn create_sell_order(
     
     // Validate the program created the escrow account
     if escrow_account.key != &escrow_pda {
-        msg!("escrow_account key, {:?}", escrow_account.key);
-        msg!("escrow_account owner, {:?}", escrow_account.owner);
-        msg!("program_id, {:?}", program_id);
-        msg!("Invalid program ID");
         return Err(ProgramError::IncorrectProgramId)
     }
     // if escrow_account.owner != program_id {
@@ -140,6 +145,13 @@ pub fn create_sell_order(
     if escrow_pda != *escrow_account.key {
         return Err(ProgramError::InvalidSeeds);
     }
+
+    // Derive PDA for the user
+    if escrow_sol_token_pda != *escrow_sol_token_account.key {
+        msg!("Escrow token account does not match");
+        return Err(ProgramError::InvalidSeeds);
+    }
+
 
     // Create order account
     let rent = Rent::get()?;
@@ -170,6 +182,31 @@ pub fn create_sell_order(
         ]],
     )?;
 
+    // create sol token account
+    let space = 0;
+    let lamports = rent.minimum_balance(space);
+    let signer_seeds = &[
+        SellOrder::SEED_TOKEN_PREFIX,
+        escrow_pda.as_ref(),
+        &[escrow_sol_token_bump]
+    ];
+
+    invoke_signed(
+        &system_instruction::create_account(
+            authority_account.key,
+            &escrow_sol_token_pda,
+            lamports,
+            space as u64,
+            &system_program::ID,
+        ),
+        &[
+            authority_account.clone(),
+            escrow_sol_token_account.clone(),
+            system_program.clone(),
+        ],
+        &[signer_seeds],
+    )?;
+
     // Initialize order data
     let order_data = SellOrder {
         order_id,
@@ -187,10 +224,10 @@ pub fn create_sell_order(
     counter_data.serialize(&mut &mut counter_account.data.borrow_mut()[..])?;
 
     let _ = &invoke(
-        &system_instruction::transfer(seller_account.key, escrow_account.key, sell_order_data.amount),
+        &system_instruction::transfer(seller_account.key, escrow_sol_token_account.key, sell_order_data.amount),
         &[
             seller_account.clone(),
-            escrow_account.clone(),
+            escrow_sol_token_account.clone(),
         ]
     )?;
 
@@ -256,7 +293,7 @@ fn fulfil_buy_order(
 ) -> ProgramResult {
     // const USDC_TOKEN_MINT: &str = "Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr";
     // const USDC_TOKEN_MINT: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
-    const USDC_DECIMAL: u64 = 1000000;
+    // const USDC_DECIMAL: u64 = 1000000;
     let accounts_iterations = &mut accounts.iter();
 
     let authority = next_account_info(accounts_iterations)?;
@@ -267,6 +304,7 @@ fn fulfil_buy_order(
     let escrow_account = next_account_info(accounts_iterations)?;
     let seller_associated_token_account = next_account_info(accounts_iterations)?;
     let buyer_associated_token_account = next_account_info(accounts_iterations)?;
+    let escrow_sol_token_account = next_account_info(accounts_iterations)?;
 
     let buy_order_data = BuyOrder::try_from_slice(_instruction_data).map_err(|err| {
         msg!("Error Deseriealizing order, {:?}", err);
@@ -310,16 +348,28 @@ fn fulfil_buy_order(
         &buy_order_data.order_id.to_le_bytes(),
     ];
 
-    let (_, bump) = Pubkey::find_program_address(seeds, program_id);
+    let (escrow_pda, escrow_pda_bump) = Pubkey::find_program_address(seeds, program_id);
 
+    if escrow_account.key != &escrow_pda {
+        msg!("Escrow account does not match derived escrow account");
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let seeds = &[
+        SellOrder::SEED_TOKEN_PREFIX,
+        escrow_pda.as_ref(),
+    ];
+
+    let (escrow_sol_token_address, bump) = Pubkey::find_program_address(seeds, program_id);
+          
     let signer_seeds  = &[
-        SellOrder::SEED_PREFIX,
-        seller_account.key.as_ref(),
-        &buy_order_data.order_id.to_le_bytes(),
+        SellOrder::SEED_TOKEN_PREFIX,
+        escrow_pda.as_ref(),
         &[bump]
     ];
 
-    let usdc_to_transfer_in_decimals = ((escrow_account_data.amount * escrow_account_data.price) / LAMPORTS_PER_SOL) * USDC_DECIMAL;
+    let usdc_to_transfer_in_decimals = (escrow_account_data.amount * escrow_account_data.price) / LAMPORTS_PER_SOL;
+    // let usdc_to_transfer_in_decimals = ((escrow_account_data.amount * escrow_account_data.price) / LAMPORTS_PER_SOL) * USDC_DECIMAL;
 
     let transfer_to_seller_ix = spl_token_transfer(
         &spl_token::id(), // Token program ID (usually "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
@@ -344,36 +394,41 @@ fn fulfil_buy_order(
     let sol_to_transfer_in_lamports = escrow_account_data.amount;
 
     //Manual trasfer logic
-    if escrow_account.lamports() < sol_to_transfer_in_lamports {
-        return Err(ProgramError::InsufficientFunds);
+    // if escrow_account.lamports() < sol_to_transfer_in_lamports {
+    //     return Err(ProgramError::InsufficientFunds);
+    // }
+
+    // // Subtract lamports from source
+    // **escrow_account.lamports.borrow_mut() -= sol_to_transfer_in_lamports;
+    
+    // // Add lamports to destination
+    // **buyer_account.lamports.borrow_mut() += sol_to_transfer_in_lamports;
+
+    if escrow_sol_token_account.key != &escrow_sol_token_address {
+        msg!("Escrow token account derived do not match");
+        return Err(ProgramError::InvalidArgument)
     }
 
-    // Subtract lamports from source
-    **escrow_account.lamports.borrow_mut() -= sol_to_transfer_in_lamports;
-    
-    // Add lamports to destination
-    **buyer_account.lamports.borrow_mut() += sol_to_transfer_in_lamports;
+    let transfer_to_buyer_ix = &system_instruction::transfer(
+        &escrow_sol_token_account.key,
+        buyer_account.key,
+        sol_to_transfer_in_lamports
+    );
 
-    // let transfer_to_buyer_ix = &system_instruction::transfer(
-    //     escrow_account.key,
-    //     buyer_account.key,
-    //     sol_to_transfer_in_lamports
-    // );
+    //Clear here
 
-    // //Clear here
-
-    // // Transfer SOl to buyer
-    // invoke_signed(
-    //     transfer_to_buyer_ix,
-    //     &[
-    //         escrow_account.clone(),
-    //         buyer_account.clone(),
-    //         system_program.clone(),
-    //         // authority.clone(),
-    //     ],
-    //     &[signer_seeds],
-    //     // &[seeds, &[&[bump]]],
-    // )?;
+    // Transfer SOl to buyer
+    invoke_signed(
+        transfer_to_buyer_ix,
+        &[
+            escrow_sol_token_account.clone(),
+            authority.clone(),
+            buyer_account.clone(),
+            system_program.clone(),
+        ],
+        &[signer_seeds],
+        // &[seeds, &[&[bump]]],
+    )?;
 
     escrow_account_data.status = OrderStatus::Completed;
     let _ = escrow_account_data.serialize(&mut &mut escrow_account.data.borrow_mut()[..]);
@@ -381,11 +436,50 @@ fn fulfil_buy_order(
 
     // Step 1: Transfer remaining SOL from the PDA to the authority account
     let escrow_account_balance = **escrow_account.lamports.borrow();
+    let escrow_sol_token_account_balance = **escrow_sol_token_account.lamports.borrow();
     
+    // closing escrow sol token account
+    if escrow_sol_token_account_balance > 0 {
+        msg!("Transferring {} lamports to authority", escrow_sol_token_account_balance);
 
+        // **escrow_account.lamports.borrow_mut() -= escrow_account_balance;
+
+        // **authority.lamports.borrow_mut() += escrow_account_balance;
+
+        let transfer_instruction = system_instruction::transfer(
+            &escrow_sol_token_account.key,    // From PDA account
+            authority.key,     // To authority account
+            escrow_sol_token_account_balance,               // Amount to transfer
+        );
+
+        invoke_signed(
+            &transfer_instruction,
+            &[
+                escrow_sol_token_account.clone(),
+                authority.clone(),
+                system_program.clone(),
+            ],
+            &[signer_seeds], // PDA seeds for signing
+            // &[seeds, &[&[bump]]], // PDA seeds for signing
+        )?
+        ;
+    }
+    // Set the PDA's lamports to 0 and assign ownership to the System Program
+    **escrow_sol_token_account.lamports.borrow_mut() = 0;
+    escrow_sol_token_account.assign(&system_program::ID);
+
+    // let signer_seeds = &[
+    //     SellOrder::SEED_PREFIX,
+    //     seller_account.key.as_ref(),
+    //     &buy_order_data.order_id.to_le_bytes(),
+    //     &[escrow_pda_bump]
+    // ];
+
+    // closing escrow data account
     if escrow_account_balance > 0 {
         msg!("Transferring {} lamports to authority", escrow_account_balance);
 
+        //Manual deduction because the program is the owner of the account
         **escrow_account.lamports.borrow_mut() -= escrow_account_balance;
 
         **authority.lamports.borrow_mut() += escrow_account_balance;
